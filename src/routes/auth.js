@@ -35,7 +35,9 @@ router.post('/register', async (req, res) => {
       return res.status(400).json({ error: 'Kullanici Hizmet Sozlesmesi kabul edilmeden kayit tamamlanamaz.', field: 'termsAccepted' });
     if (!kvkkAccepted)
       return res.status(400).json({ error: 'KVKK Aydinlatma Metni onayi olmadan kayit tamamlanamaz.', field: 'kvkkAccepted' });
-    if (db.prepare('SELECT id FROM users WHERE email=?').get(email.toLowerCase()))
+
+    const existing = await db.oneOrNone('SELECT id FROM users WHERE email = $1', [email.toLowerCase()]);
+    if (existing)
       return res.status(409).json({ error: 'Bu e-posta adresi zaten kayitli.' });
 
     const cleanPhone = (phone || '').replace(/\s/g, '');
@@ -52,20 +54,22 @@ router.post('/register', async (req, res) => {
     const verifyToken   = crypto.randomBytes(32).toString('hex');
     const verifyExpires = new Date(Date.now() + 24 * 3600000).toISOString();
 
-    db.prepare(`INSERT INTO users
-      (id,email,password,name,clinic_name,phone,plan,trial_ends,settings,
-       terms_accepted_at,terms_version,kvkk_accepted_at,ip_at_acceptance,
-       email_verified,email_verify_token,email_verify_expires)
-      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,0,?,?)`)
-      .run(
+    await db.none(
+      `INSERT INTO users
+        (id, email, password, name, clinic_name, phone, plan, trial_ends, settings,
+         terms_accepted_at, terms_version, kvkk_accepted_at, ip_at_acceptance,
+         email_verified, email_verify_token, email_verify_expires)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,0,$14,$15)`,
+      [
         id, email.toLowerCase(), hashed, name, clinicName || '',
         cleanPhone, 'trial', trialEnds, settings,
         now, TERMS_VERSION, now, ip,
         verifyToken, verifyExpires
-      );
+      ]
+    );
 
-    _audit(id, `HESAP OLUSTURULDU — ${email} — Sozlesme v${TERMS_VERSION} — IP:${ip}`, req);
-    if (aiConsentGiven) _audit(id, 'AI YURT DISI AKTARIM RIZASI VERILDI', req);
+    await _audit(id, `HESAP OLUSTURULDU — ${email} — Sozlesme v${TERMS_VERSION} — IP:${ip}`, req);
+    if (aiConsentGiven) await _audit(id, 'AI YURT DISI AKTARIM RIZASI VERILDI', req);
 
     sendEmailVerification({ name, email, verifyToken }).catch(e =>
       console.error('[Email] Verify:', e.message)
@@ -88,51 +92,55 @@ router.post('/verify-email', async (req, res) => {
     const { token } = req.body;
     if (!token) return res.status(400).json({ error: 'Token gerekli.' });
 
-    const user = db.prepare(`
+    const user = await db.oneOrNone(`
       SELECT * FROM users
-      WHERE email_verify_token = ?
-        AND email_verify_expires > datetime('now')
+      WHERE email_verify_token = $1
+        AND email_verify_expires > NOW()
         AND email_verified = 0
-    `).get(token);
+    `, [token]);
 
     if (!user) {
-      const expired = db.prepare(
-        'SELECT id FROM users WHERE email_verify_token=? AND email_verified=0'
-      ).get(token);
+      const expired = await db.oneOrNone(
+        'SELECT id FROM users WHERE email_verify_token = $1 AND email_verified = 0',
+        [token]
+      );
       if (expired)
         return res.status(400).json({
           error: 'Dogrulama baglantisi suresi dolmus. Yeni baglanti isteyin.',
           code: 'TOKEN_EXPIRED'
         });
-      // Already verified?
-      const alreadyVerified = db.prepare('SELECT id FROM users WHERE email_verify_token=?').get(token);
+
+      const alreadyVerified = await db.oneOrNone(
+        'SELECT id FROM users WHERE email_verify_token = $1',
+        [token]
+      );
       if (!alreadyVerified)
         return res.status(400).json({ error: 'Gecersiz dogrulama baglantisi.', code: 'TOKEN_INVALID' });
-      // token exists but user is already verified
-      const vUser = db.prepare('SELECT * FROM users WHERE email_verify_token=?').get(token);
+
+      const vUser = await db.oneOrNone('SELECT * FROM users WHERE email_verify_token = $1', [token]);
       if (vUser && vUser.email_verified) {
-        db.prepare('UPDATE users SET email_verify_token=NULL WHERE id=?').run(vUser.id);
-        const fresh = db.prepare('SELECT * FROM users WHERE id=?').get(vUser.id);
+        await db.none('UPDATE users SET email_verify_token = NULL WHERE id = $1', [vUser.id]);
+        const fresh = await db.oneOrNone('SELECT * FROM users WHERE id = $1', [vUser.id]);
         return res.json({ token: sign(vUser.id, vUser.email), user: _safeUser(fresh) });
       }
       return res.status(400).json({ error: 'Gecersiz dogrulama baglantisi.', code: 'TOKEN_INVALID' });
     }
 
-    db.prepare(`
+    await db.none(`
       UPDATE users SET
-        email_verified=1,
-        email_verify_token=NULL,
-        email_verify_expires=NULL,
-        updated_at=datetime('now')
-      WHERE id=?
-    `).run(user.id);
+        email_verified = 1,
+        email_verify_token = NULL,
+        email_verify_expires = NULL,
+        updated_at = NOW()
+      WHERE id = $1
+    `, [user.id]);
 
-    _audit(user.id, `E-POSTA DOGRULANDI — ${user.email}`, req);
+    await _audit(user.id, `E-POSTA DOGRULANDI — ${user.email}`, req);
 
     sendWelcome({ name: user.name, email: user.email, trialEnds: user.trial_ends })
       .catch(e => console.error('[Email] Welcome:', e.message));
 
-    const freshUser = db.prepare('SELECT * FROM users WHERE id=?').get(user.id);
+    const freshUser = await db.oneOrNone('SELECT * FROM users WHERE id = $1', [user.id]);
     res.json({ token: sign(user.id, user.email), user: _safeUser(freshUser) });
   } catch (e) {
     console.error('[Auth] Verify email:', e);
@@ -146,20 +154,20 @@ router.post('/resend-verification', async (req, res) => {
     const { email } = req.body;
     if (!email) return res.status(400).json({ error: 'E-posta zorunludur.' });
 
-    const user = db.prepare('SELECT * FROM users WHERE email=?').get(email.toLowerCase());
+    const user = await db.oneOrNone('SELECT * FROM users WHERE email = $1', [email.toLowerCase()]);
     if (!user || user.email_verified)
       return res.json({ message: 'Dogrulama e-postasi gonderildi.' });
 
     const verifyToken   = crypto.randomBytes(32).toString('hex');
     const verifyExpires = new Date(Date.now() + 24 * 3600000).toISOString();
 
-    db.prepare(`UPDATE users SET
-      email_verify_token=?, email_verify_expires=?, updated_at=datetime('now')
-      WHERE id=?`
-    ).run(verifyToken, verifyExpires, user.id);
+    await db.none(
+      `UPDATE users SET email_verify_token = $1, email_verify_expires = $2, updated_at = NOW() WHERE id = $3`,
+      [verifyToken, verifyExpires, user.id]
+    );
 
     await sendEmailVerification({ name: user.name, email: user.email, verifyToken });
-    _audit(user.id, 'DOGRULAMA E-POSTASI YENIDEN GONDERILDI', req);
+    await _audit(user.id, 'DOGRULAMA E-POSTASI YENIDEN GONDERILDI', req);
     res.json({ message: 'Dogrulama e-postasi gonderildi.' });
   } catch (e) {
     console.error('[Auth] Resend verification:', e);
@@ -174,7 +182,7 @@ router.post('/login', async (req, res) => {
     if (!email || !password)
       return res.status(400).json({ error: 'E-posta ve sifre gerekli.' });
 
-    const u = db.prepare('SELECT * FROM users WHERE email=?').get(email.toLowerCase());
+    const u = await db.oneOrNone('SELECT * FROM users WHERE email = $1', [email.toLowerCase()]);
     if (!u || !(await bcrypt.compare(password, u.password)))
       return res.status(401).json({ error: 'E-posta veya sifre hatali.' });
 
@@ -188,7 +196,7 @@ router.post('/login', async (req, res) => {
     if (!u.terms_accepted_at)
       return res.status(403).json({ error: 'Guncellennis sozlesme onayi gerekiyor.', code: 'TERMS_REQUIRED' });
 
-    _audit(u.id, `GIRIS — ${email}`, req);
+    await _audit(u.id, `GIRIS — ${email}`, req);
     res.json({ token: sign(u.id, u.email), user: _safeUser(u) });
   } catch (e) {
     console.error('[Auth] Login:', e);
@@ -197,7 +205,7 @@ router.post('/login', async (req, res) => {
 });
 
 // POST /api/auth/accept-terms
-router.post('/accept-terms', auth, (req, res) => {
+router.post('/accept-terms', auth, async (req, res) => {
   try {
     const { termsAccepted, kvkkAccepted, aiConsentGiven } = req.body;
     if (!termsAccepted || !kvkkAccepted)
@@ -206,27 +214,32 @@ router.post('/accept-terms', auth, (req, res) => {
     const now = new Date().toISOString();
     const ip  = req.headers['x-forwarded-for'] || req.socket?.remoteAddress || '';
 
-    db.prepare(`UPDATE users SET
-      terms_accepted_at=?, terms_version=?, kvkk_accepted_at=?,
-      ip_at_acceptance=?, updated_at=datetime('now') WHERE id=?`)
-      .run(now, TERMS_VERSION, now, ip, req.user.id);
-    db.prepare('UPDATE users SET settings=? WHERE id=?')
-      .run(JSON.stringify({ aiConsentGiven: !!aiConsentGiven, aiConsentAt: now }), req.user.id);
+    await db.none(
+      `UPDATE users SET
+        terms_accepted_at = $1, terms_version = $2, kvkk_accepted_at = $3,
+        ip_at_acceptance = $4, updated_at = NOW()
+       WHERE id = $5`,
+      [now, TERMS_VERSION, now, ip, req.user.id]
+    );
+    await db.none(
+      'UPDATE users SET settings = $1 WHERE id = $2',
+      [JSON.stringify({ aiConsentGiven: !!aiConsentGiven, aiConsentAt: now }), req.user.id]
+    );
 
-    _audit(req.user.id, `SOZLESME GUNCELLENDI v${TERMS_VERSION} — IP:${ip}`, req);
+    await _audit(req.user.id, `SOZLESME GUNCELLENDI v${TERMS_VERSION} — IP:${ip}`, req);
     res.json({ ok: true });
   } catch (e) { res.status(500).json({ error: 'Sunucu hatasi.' }); }
 });
 
 // POST /api/auth/logout
-router.post('/logout', auth, (req, res) => {
-  _audit(req.user.id, 'CIKIS', req);
+router.post('/logout', auth, async (req, res) => {
+  await _audit(req.user.id, 'CIKIS', req);
   res.json({ ok: true });
 });
 
 // GET /api/auth/me
-router.get('/me', auth, (req, res) => {
-  const u = db.prepare('SELECT * FROM users WHERE id=?').get(req.user.id);
+router.get('/me', auth, async (req, res) => {
+  const u = await db.oneOrNone('SELECT * FROM users WHERE id = $1', [req.user.id]);
   if (!u) return res.status(404).json({ error: 'Kullanici bulunamadi.' });
   res.json(_safeUser(u));
 });
@@ -237,22 +250,25 @@ router.put('/password', auth, async (req, res) => {
     const { current, next: newPass } = req.body;
     if (!current || !newPass || newPass.length < 8)
       return res.status(400).json({ error: 'Gecersiz sifre. En az 8 karakter olmali.' });
-    const u = db.prepare('SELECT * FROM users WHERE id=?').get(req.user.id);
+    const u = await db.oneOrNone('SELECT * FROM users WHERE id = $1', [req.user.id]);
     if (!(await bcrypt.compare(current, u.password)))
       return res.status(401).json({ error: 'Mevcut sifre yanlis.' });
-    db.prepare('UPDATE users SET password=?, updated_at=datetime(\'now\') WHERE id=?')
-      .run(await bcrypt.hash(newPass, ROUNDS), req.user.id);
-    _audit(req.user.id, 'SIFRE DEGISTIRILDI', req);
+    await db.none(
+      'UPDATE users SET password = $1, updated_at = NOW() WHERE id = $2',
+      [await bcrypt.hash(newPass, ROUNDS), req.user.id]
+    );
+    await _audit(req.user.id, 'SIFRE DEGISTIRILDI', req);
     sendPasswordChanged({ name: u.name, email: u.email }).catch(e => console.error('[Email] PwChanged:', e.message));
     res.json({ ok: true });
   } catch (e) { console.error('[Auth] Password change:', e); res.status(500).json({ error: 'Sunucu hatasi.' }); }
 });
 
 // GET /api/auth/legal-proof
-router.get('/legal-proof', auth, (req, res) => {
-  const u = db.prepare(
-    'SELECT email,name,phone,terms_accepted_at,terms_version,kvkk_accepted_at,ip_at_acceptance FROM users WHERE id=?'
-  ).get(req.user.id);
+router.get('/legal-proof', auth, async (req, res) => {
+  const u = await db.oneOrNone(
+    'SELECT email, name, phone, terms_accepted_at, terms_version, kvkk_accepted_at, ip_at_acceptance FROM users WHERE id = $1',
+    [req.user.id]
+  );
   res.json({ userId: req.user.id, ...u, generatedAt: new Date().toISOString(),
     note: 'KVKK Madde 11 kapsamindasozlesme kabulunun teknik ispat belgesidir.' });
 });
@@ -262,11 +278,17 @@ router.post('/forgot-password', async (req, res) => {
   try {
     const { email } = req.body;
     if (!email) return res.status(400).json({ error: 'E-posta zorunludur.' });
-    const user = db.prepare('SELECT id, name, email FROM users WHERE email=?').get(email.toLowerCase().trim());
+    const user = await db.oneOrNone(
+      'SELECT id, name, email FROM users WHERE email = $1',
+      [email.toLowerCase().trim()]
+    );
     if (!user) return res.json({ message: 'E-posta gonderildi.' });
     const token   = crypto.randomBytes(32).toString('hex');
     const expires = new Date(Date.now() + 3600000).toISOString();
-    db.prepare('UPDATE users SET reset_token=?, reset_token_expires=? WHERE id=?').run(token, expires, user.id);
+    await db.none(
+      'UPDATE users SET reset_token = $1, reset_token_expires = $2 WHERE id = $3',
+      [token, expires, user.id]
+    );
     await sendPasswordReset({ name: user.name, email: user.email, resetToken: token });
     res.json({ message: 'E-posta gonderildi.' });
   } catch (e) { console.error('[Auth] Forgot password:', e); res.status(500).json({ error: 'Sunucu hatasi.' }); }
@@ -278,11 +300,17 @@ router.post('/reset-password', async (req, res) => {
     const { token, password } = req.body;
     if (!token || !password) return res.status(400).json({ error: 'Token ve sifre zorunludur.' });
     if (password.length < 8) return res.status(400).json({ error: 'Sifre en az 8 karakter olmalidir.' });
-    const user = db.prepare(`SELECT id, name, email FROM users WHERE reset_token = ? AND reset_token_expires > datetime('now')`).get(token);
+    const user = await db.oneOrNone(
+      `SELECT id, name, email FROM users WHERE reset_token = $1 AND reset_token_expires > NOW()`,
+      [token]
+    );
     if (!user) return res.status(400).json({ error: 'Gecersiz veya suresi dolmus baglanti.' });
     const hash = await bcrypt.hash(password, ROUNDS);
-    db.prepare('UPDATE users SET password=?, reset_token=NULL, reset_token_expires=NULL, updated_at=datetime(\'now\') WHERE id=?').run(hash, user.id);
-    _audit(user.id, 'SIFRE SIFIRLANDI', { headers: {}, socket: {} });
+    await db.none(
+      'UPDATE users SET password = $1, reset_token = NULL, reset_token_expires = NULL, updated_at = NOW() WHERE id = $2',
+      [hash, user.id]
+    );
+    await _audit(user.id, 'SIFRE SIFIRLANDI', { headers: {}, socket: {} });
     sendPasswordChanged({ name: user.name, email: user.email }).catch(e => console.error('[Email] PwReset:', e.message));
     res.json({ message: 'Sifre basariyla guncellendi.' });
   } catch (e) { console.error('[Auth] Reset password:', e); res.status(500).json({ error: 'Sunucu hatasi.' }); }
@@ -304,10 +332,10 @@ function _safeUser(u) {
   };
 }
 
-function _audit(uid, action, req) {
+async function _audit(uid, action, req) {
   try {
     const ip = req?.headers?.['x-forwarded-for'] || req?.socket?.remoteAddress || '';
-    db.prepare('INSERT INTO audit_log (user_id,action,ip) VALUES (?,?,?)').run(uid, action, ip);
+    await db.none('INSERT INTO audit_log (user_id, action, ip) VALUES ($1, $2, $3)', [uid, action, ip]);
   } catch (_) {}
 }
 

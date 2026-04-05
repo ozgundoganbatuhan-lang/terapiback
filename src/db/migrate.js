@@ -1,24 +1,30 @@
 require('dotenv').config();
 const db = require('./database');
 
-// Mevcut tabloya sözleşme kabul kolonları ekle
+// This migrate script is kept for manual one-off migrations.
+// The main schema is auto-applied by database.js on startup.
+// Add any additional ALTER TABLE statements here as needed.
+
 const migrations = [
-  `ALTER TABLE users ADD COLUMN terms_accepted_at TEXT DEFAULT NULL`,
-  `ALTER TABLE users ADD COLUMN terms_version TEXT DEFAULT NULL`,
-  `ALTER TABLE users ADD COLUMN kvkk_accepted_at TEXT DEFAULT NULL`,
-  `ALTER TABLE users ADD COLUMN ip_at_acceptance TEXT DEFAULT NULL`,
+  `ALTER TABLE users ADD COLUMN IF NOT EXISTS terms_accepted_at TEXT DEFAULT NULL`,
+  `ALTER TABLE users ADD COLUMN IF NOT EXISTS terms_version TEXT DEFAULT NULL`,
+  `ALTER TABLE users ADD COLUMN IF NOT EXISTS kvkk_accepted_at TEXT DEFAULT NULL`,
+  `ALTER TABLE users ADD COLUMN IF NOT EXISTS ip_at_acceptance TEXT DEFAULT NULL`,
+  `ALTER TABLE users ADD COLUMN IF NOT EXISTS reset_token TEXT DEFAULT NULL`,
+  `ALTER TABLE users ADD COLUMN IF NOT EXISTS reset_token_expires TEXT DEFAULT NULL`,
 ];
 
-migrations.forEach(sql => {
-  try { db.prepare(sql).run(); console.log('✅', sql.slice(0,60)); }
-  catch(e) { if (!e.message.includes('duplicate column')) console.error('⚠️', e.message); }
-});
+async function runMigrations() {
+  for (const sql of migrations) {
+    try {
+      await db.none(sql);
+      console.log('✅', sql.slice(0, 60));
+    } catch (e) {
+      console.error('⚠️', e.message);
+    }
+  }
+  console.log('Migration tamamlandı.');
+  process.exit(0);
+}
 
-console.log('Migration tamamlandı.');
-
-// E-posta şifre sıfırlama kolonları
-try {
-  db.exec(`ALTER TABLE users ADD COLUMN reset_token TEXT DEFAULT NULL`);
-  db.exec(`ALTER TABLE users ADD COLUMN reset_token_expires TEXT DEFAULT NULL`);
-  console.log('✅ reset_token kolonları eklendi');
-} catch(e) { /* zaten var */ }
+runMigrations().catch(e => { console.error(e); process.exit(1); });

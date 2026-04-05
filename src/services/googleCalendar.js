@@ -35,8 +35,10 @@ async function handleCallback(code, userId) {
   const calList = await cal.calendarList.get({ calendarId: 'primary' });
   const gcalId = calList.data.id;
 
-  db.prepare("UPDATE users SET gcal_tokens=?, gcal_id=?, updated_at=datetime('now') WHERE id=?")
-    .run(JSON.stringify(tokens), gcalId, userId);
+  await db.none(
+    'UPDATE users SET gcal_tokens=$1, gcal_id=$2, updated_at=NOW() WHERE id=$3',
+    [JSON.stringify(tokens), gcalId, userId]
+  );
 
   return { gcalId };
 }
@@ -48,12 +50,12 @@ async function getAuthForUser(user) {
   oAuth2.setCredentials(tokens);
 
   // Token yenileme event'i — DB'ye kaydet
-  oAuth2.on('tokens', (newTokens) => {
+  oAuth2.on('tokens', async (newTokens) => {
     if (newTokens.refresh_token) tokens.refresh_token = newTokens.refresh_token;
     tokens.access_token = newTokens.access_token;
     tokens.expiry_date  = newTokens.expiry_date;
-    db.prepare("UPDATE users SET gcal_tokens=? WHERE id=?")
-      .run(JSON.stringify(tokens), user.id);
+    await db.none('UPDATE users SET gcal_tokens=$1 WHERE id=$2', [JSON.stringify(tokens), user.id])
+      .catch(e => console.error('[GCal] Token save error:', e.message));
   });
 
   return oAuth2;
@@ -66,17 +68,17 @@ async function syncToGcal(user, apt) {
   const calId = user.gcal_id || 'primary';
 
   const endTime = new Date(new Date(apt.atTime).getTime() + apt.duration * 60000).toISOString();
-  const medMap  = { face: 'Yüz Yüze', online: '🖥️ Online', phone: '📞 Telefon' };
+  const medMap  = { face: 'Yuz Yuze', online: 'Online', phone: 'Telefon' };
 
   const event = {
-    summary: `🌿 ${apt.patientName} — ${apt.therapy}`,
+    summary: `${apt.patientName} — ${apt.therapy}`,
     description: [
       `Terapi: ${apt.therapy}`,
       `Ortam: ${medMap[apt.medium] || apt.medium}`,
-      `Süre: ${apt.duration} dakika`,
+      `Sure: ${apt.duration} dakika`,
       apt.note ? `Not: ${apt.note}` : '',
       '',
-      '—— TerapiSeansım ——',
+      '—— TerapiSeansim ——',
     ].filter(Boolean).join('\n'),
     start: { dateTime: apt.atTime, timeZone: 'Europe/Istanbul' },
     end:   { dateTime: endTime,    timeZone: 'Europe/Istanbul' },
@@ -126,7 +128,7 @@ async function fetchUpcoming(user, days = 30) {
     timeMax: maxTime,
     singleEvents: true,
     orderBy: 'startTime',
-    q: 'TerapiSeansım',
+    q: 'TerapiSeansim',
     maxResults: 50,
   });
   return res.data.items || [];
@@ -138,7 +140,7 @@ async function revokeAccess(user) {
     const auth = await getAuthForUser(user);
     await auth.revokeCredentials();
   } catch(_) {}
-  db.prepare("UPDATE users SET gcal_tokens=NULL, gcal_id=NULL WHERE id=?").run(user.id);
+  await db.none('UPDATE users SET gcal_tokens=NULL, gcal_id=NULL WHERE id=$1', [user.id]);
 }
 
 module.exports = { getAuthUrl, handleCallback, syncToGcal, deleteFromGcal, fetchUpcoming, revokeAccess };
