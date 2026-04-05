@@ -2,16 +2,17 @@
 const jwt = require('jsonwebtoken');
 const db  = require('../db/database');
 
-module.exports = function auth(req, res, next) {
+module.exports = async function auth(req, res, next) {
   const hdr = req.headers.authorization;
   if (!hdr?.startsWith('Bearer '))
     return res.status(401).json({ error: 'Token gerekli.' });
 
   try {
     const payload = jwt.verify(hdr.slice(7), process.env.JWT_SECRET);
-    const user = db.prepare(
-      'SELECT id, email, name, clinic_name, plan, trial_ends FROM users WHERE id = ?'
-    ).get(payload.id);
+    const user = await db.oneOrNone(
+      'SELECT id, email, name, clinic_name, plan, trial_ends FROM users WHERE id = $1',
+      [payload.id]
+    );
     if (!user) return res.status(401).json({ error: 'Geçersiz token.' });
 
     // Trial süresi kontrolü

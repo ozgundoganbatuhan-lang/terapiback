@@ -35,102 +35,137 @@ function fmt(p) {
 }
 
 // GET /api/patients
-router.get('/', (req, res) => {
-  const rows = db.prepare(`
-    SELECT p.*,
-      (SELECT score FROM scores WHERE patient_id=p.id AND scale='PHQ9' ORDER BY date DESC LIMIT 1) last_phq9,
-      (SELECT score FROM scores WHERE patient_id=p.id AND scale='GAD7'  ORDER BY date DESC LIMIT 1) last_gad7,
-      (SELECT sessions FROM packages WHERE patient_id=p.id ORDER BY created_at DESC LIMIT 1) pkg_total,
-      (SELECT used     FROM packages WHERE patient_id=p.id ORDER BY created_at DESC LIMIT 1) pkg_used,
-      (SELECT COUNT(*) FROM appointments WHERE patient_id=p.id AND status='COMPLETED') total_sessions
-    FROM patients p WHERE p.user_id=?
-    ORDER BY p.first_name ASC
-  `).all(req.user.id);
-  res.json(rows.map(fmt));
+router.get('/', async (req, res) => {
+  try {
+    const rows = await db.any(`
+      SELECT p.*,
+        (SELECT score FROM scores WHERE patient_id=p.id AND scale='PHQ9' ORDER BY date DESC LIMIT 1) last_phq9,
+        (SELECT score FROM scores WHERE patient_id=p.id AND scale='GAD7'  ORDER BY date DESC LIMIT 1) last_gad7,
+        (SELECT sessions FROM packages WHERE patient_id=p.id ORDER BY created_at DESC LIMIT 1) pkg_total,
+        (SELECT used     FROM packages WHERE patient_id=p.id ORDER BY created_at DESC LIMIT 1) pkg_used,
+        (SELECT COUNT(*) FROM appointments WHERE patient_id=p.id AND status='COMPLETED') total_sessions
+      FROM patients p WHERE p.user_id=$1
+      ORDER BY p.first_name ASC
+    `, [req.user.id]);
+    res.json(rows.map(fmt));
+  } catch (e) { console.error('[Patients] GET /:', e); res.status(500).json({ error: 'Sunucu hatasi.' }); }
 });
 
 // GET /api/patients/:id
-router.get('/:id', (req, res) => {
-  const p = db.prepare('SELECT * FROM patients WHERE id=? AND user_id=?').get(req.params.id, req.user.id);
-  if (!p) return res.status(404).json({ error: 'Hasta bulunamadı.' });
-  res.json(fmt(p));
+router.get('/:id', async (req, res) => {
+  try {
+    const p = await db.oneOrNone('SELECT * FROM patients WHERE id=$1 AND user_id=$2', [req.params.id, req.user.id]);
+    if (!p) return res.status(404).json({ error: 'Hasta bulunamadi.' });
+    res.json(fmt(p));
+  } catch (e) { res.status(500).json({ error: 'Sunucu hatasi.' }); }
 });
 
 // POST /api/patients  — frontend: {fn, ln, dob, gender, phone, email, complaint, therapy_type, price, emergency_contact}
-router.post('/', (req, res) => {
-  const { fn, ln, dob, gender, phone, email, complaint, therapy_type, price, emergency_contact } = req.body;
-  if (!fn?.trim() || !ln?.trim()) return res.status(400).json({ error: 'Ad ve soyad zorunludur.' });
+router.post('/', async (req, res) => {
+  try {
+    const { fn, ln, dob, gender, phone, email, complaint, therapy_type, price, emergency_contact } = req.body;
+    if (!fn?.trim() || !ln?.trim()) return res.status(400).json({ error: 'Ad ve soyad zorunludur.' });
 
-  const cnt   = db.prepare('SELECT COUNT(*) c FROM patients WHERE user_id=?').get(req.user.id).c;
-  const color = COLORS[cnt % COLORS.length];
-  const id    = uuid();
+    const cntRow = await db.one('SELECT COUNT(*) c FROM patients WHERE user_id=$1', [req.user.id]);
+    const cnt    = parseInt(cntRow.c);
+    const color  = COLORS[cnt % COLORS.length];
+    const id     = uuid();
 
-  db.prepare(`INSERT INTO patients (id,user_id,first_name,last_name,dob,gender,phone,email,complaint,therapy,price,emergency,color)
-    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`)
-    .run(id, req.user.id, fn.trim(), ln.trim(), dob||null, gender||null,
-         phone||null, email||null, complaint||null,
-         therapy_type||'BDT', parseFloat(price)||0, emergency_contact||null, color);
+    await db.none(
+      `INSERT INTO patients (id,user_id,first_name,last_name,dob,gender,phone,email,complaint,therapy,price,emergency,color)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`,
+      [id, req.user.id, fn.trim(), ln.trim(), dob||null, gender||null,
+       phone||null, email||null, complaint||null,
+       therapy_type||'BDT', parseFloat(price)||0, emergency_contact||null, color]
+    );
 
-  _audit(req.user.id, `YENİ HASTA — ${fn} ${ln}`, req);
-  res.status(201).json(fmt(db.prepare('SELECT * FROM patients WHERE id=?').get(id)));
+    await _audit(req.user.id, `YENI HASTA — ${fn} ${ln}`, req);
+    const p = await db.oneOrNone('SELECT * FROM patients WHERE id=$1', [id]);
+    res.status(201).json(fmt(p));
+  } catch (e) { console.error('[Patients] POST:', e); res.status(500).json({ error: 'Sunucu hatasi.' }); }
 });
 
 // PUT /api/patients/:id
-router.put('/:id', (req, res) => {
-  const existing = db.prepare('SELECT * FROM patients WHERE id=? AND user_id=?').get(req.params.id, req.user.id);
-  if (!existing) return res.status(404).json({ error: 'Bulunamadı.' });
+router.put('/:id', async (req, res) => {
+  try {
+    const existing = await db.oneOrNone('SELECT * FROM patients WHERE id=$1 AND user_id=$2', [req.params.id, req.user.id]);
+    if (!existing) return res.status(404).json({ error: 'Bulunamadi.' });
 
-  const { fn, ln, dob, gender, phone, email, complaint, therapy_type, price, emergency_contact } = req.body;
-  db.prepare(`UPDATE patients SET
-    first_name=COALESCE(?,first_name), last_name=COALESCE(?,last_name),
-    dob=?, gender=COALESCE(?,gender), phone=?, email=?, complaint=?,
-    therapy=COALESCE(?,therapy), price=COALESCE(?,price), emergency=?,
-    updated_at=datetime('now') WHERE id=? AND user_id=?`)
-    .run(fn||null, ln||null, dob||null, gender||null, phone||null, email||null,
-         complaint||null, therapy_type||null, parseFloat(price)||null,
-         emergency_contact||null, req.params.id, req.user.id);
+    const { fn, ln, dob, gender, phone, email, complaint, therapy_type, price, emergency_contact } = req.body;
+    await db.none(
+      `UPDATE patients SET
+        first_name = COALESCE($1, first_name),
+        last_name  = COALESCE($2, last_name),
+        dob        = $3,
+        gender     = COALESCE($4, gender),
+        phone      = $5,
+        email      = $6,
+        complaint  = $7,
+        therapy    = COALESCE($8, therapy),
+        price      = COALESCE($9, price),
+        emergency  = $10,
+        updated_at = NOW()
+       WHERE id=$11 AND user_id=$12`,
+      [fn||null, ln||null, dob||null, gender||null, phone||null, email||null,
+       complaint||null, therapy_type||null, parseFloat(price)||null,
+       emergency_contact||null, req.params.id, req.user.id]
+    );
 
-  res.json(fmt(db.prepare('SELECT * FROM patients WHERE id=?').get(req.params.id)));
+    const p = await db.oneOrNone('SELECT * FROM patients WHERE id=$1', [req.params.id]);
+    res.json(fmt(p));
+  } catch (e) { console.error('[Patients] PUT:', e); res.status(500).json({ error: 'Sunucu hatasi.' }); }
 });
 
 // DELETE /api/patients/:id
-router.delete('/:id', (req, res) => {
-  const p = db.prepare('SELECT first_name,last_name FROM patients WHERE id=? AND user_id=?')
-    .get(req.params.id, req.user.id);
-  if (!p) return res.status(404).json({ error: 'Bulunamadı.' });
-  db.prepare('DELETE FROM patients WHERE id=? AND user_id=?').run(req.params.id, req.user.id);
-  _audit(req.user.id, `HASTA SİLİNDİ — ${p.first_name} ${p.last_name}`, req);
-  res.json({ ok: true });
+router.delete('/:id', async (req, res) => {
+  try {
+    const p = await db.oneOrNone(
+      'SELECT first_name, last_name FROM patients WHERE id=$1 AND user_id=$2',
+      [req.params.id, req.user.id]
+    );
+    if (!p) return res.status(404).json({ error: 'Bulunamadi.' });
+    await db.none('DELETE FROM patients WHERE id=$1 AND user_id=$2', [req.params.id, req.user.id]);
+    await _audit(req.user.id, `HASTA SILINDI — ${p.first_name} ${p.last_name}`, req);
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: 'Sunucu hatasi.' }); }
 });
 
 // POST /api/patients/:id/anonymize  (KVKK Madde 11)
-router.post('/:id/anonymize', (req, res) => {
-  const p = db.prepare('SELECT * FROM patients WHERE id=? AND user_id=?').get(req.params.id, req.user.id);
-  if (!p) return res.status(404).json({ error: 'Bulunamadı.' });
-  db.prepare(`UPDATE patients SET
-    first_name='ANONİM', last_name='VERİ-SİLİNDİ',
-    phone=NULL, email=NULL, emergency=NULL, dob=NULL,
-    complaint='[KVKK kapsamında anonimleştirildi]',
-    updated_at=datetime('now') WHERE id=? AND user_id=?`).run(req.params.id, req.user.id);
-  _audit(req.user.id, `KVKK ANONİMLEŞTİRME — ${p.first_name} ${p.last_name}`, req);
-  res.json({ ok: true });
+router.post('/:id/anonymize', async (req, res) => {
+  try {
+    const p = await db.oneOrNone('SELECT * FROM patients WHERE id=$1 AND user_id=$2', [req.params.id, req.user.id]);
+    if (!p) return res.status(404).json({ error: 'Bulunamadi.' });
+    await db.none(
+      `UPDATE patients SET
+        first_name = 'ANONIM', last_name = 'VERI-SILINDI',
+        phone = NULL, email = NULL, emergency = NULL, dob = NULL,
+        complaint = '[KVKK kapsaminda anonimlestirildi]',
+        updated_at = NOW()
+       WHERE id=$1 AND user_id=$2`,
+      [req.params.id, req.user.id]
+    );
+    await _audit(req.user.id, `KVKK ANONIMLESTIRILDI — ${p.first_name} ${p.last_name}`, req);
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: 'Sunucu hatasi.' }); }
 });
 
 // GET /api/patients/:id/export  (KVKK Madde 11)
-router.get('/:id/export', (req, res) => {
-  const p = db.prepare('SELECT * FROM patients WHERE id=? AND user_id=?').get(req.params.id, req.user.id);
-  if (!p) return res.status(404).json({ error: 'Bulunamadı.' });
-  const notes  = db.prepare('SELECT session_no,date,duration FROM session_notes WHERE patient_id=? ORDER BY date DESC').all(req.params.id);
-  const scores = db.prepare('SELECT scale,score,date FROM scores WHERE patient_id=? ORDER BY date DESC').all(req.params.id);
-  const apts   = db.prepare('SELECT at_time,therapy,duration,status FROM appointments WHERE patient_id=? ORDER BY at_time DESC').all(req.params.id);
-  _audit(req.user.id, `KVKK VERİ İHRACI — ${p.first_name} ${p.last_name}`, req);
-  res.json({
-    exportedAt: new Date().toISOString(),
-    regulation: 'KVKK 6698 Sayılı Kanun Madde 11',
-    patient: fmt(p),
-    notes: notes.map(n => ({ ...n, content: '[ŞİFRELİ — psikolog erişimi gerektirir]' })),
-    scores, appointments: apts,
-  });
+router.get('/:id/export', async (req, res) => {
+  try {
+    const p = await db.oneOrNone('SELECT * FROM patients WHERE id=$1 AND user_id=$2', [req.params.id, req.user.id]);
+    if (!p) return res.status(404).json({ error: 'Bulunamadi.' });
+    const notes  = await db.any('SELECT session_no, date, duration FROM session_notes WHERE patient_id=$1 ORDER BY date DESC', [req.params.id]);
+    const scores = await db.any('SELECT scale, score, date FROM scores WHERE patient_id=$1 ORDER BY date DESC', [req.params.id]);
+    const apts   = await db.any('SELECT at_time, therapy, duration, status FROM appointments WHERE patient_id=$1 ORDER BY at_time DESC', [req.params.id]);
+    await _audit(req.user.id, `KVKK VERI IHRACI — ${p.first_name} ${p.last_name}`, req);
+    res.json({
+      exportedAt: new Date().toISOString(),
+      regulation: 'KVKK 6698 Sayili Kanun Madde 11',
+      patient: fmt(p),
+      notes: notes.map(n => ({ ...n, content: '[SIFRELI — psikolog erisimi gerektirir]' })),
+      scores, appointments: apts,
+    });
+  } catch (e) { res.status(500).json({ error: 'Sunucu hatasi.' }); }
 });
 
 module.exports = router;

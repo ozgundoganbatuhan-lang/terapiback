@@ -8,91 +8,111 @@ const { _audit, _safeUser } = require('./auth');
 router.use(auth);
 
 // GET /api/settings
-router.get('/', (req, res) => {
-  const u = db.prepare('SELECT * FROM users WHERE id=?').get(req.user.id);
-  res.json(_safeUser(u));
+router.get('/', async (req, res) => {
+  try {
+    const u = await db.oneOrNone('SELECT * FROM users WHERE id=$1', [req.user.id]);
+    res.json(_safeUser(u));
+  } catch (e) { res.status(500).json({ error: 'Sunucu hatasi.' }); }
 });
 
 // PUT /api/settings
-router.put('/', (req, res) => {
-  const { name, clinicName, clinicAddr, clinicPhone, therapies, prices } = req.body;
-  db.prepare(`UPDATE users SET
-    name=COALESCE(?,name),
-    clinic_name=COALESCE(?,clinic_name),
-    clinic_addr=COALESCE(?,clinic_addr),
-    clinic_phone=COALESCE(?,clinic_phone),
-    therapies=COALESCE(?,therapies),
-    prices=COALESCE(?,prices),
-    updated_at=datetime('now')
-    WHERE id=?`)
-    .run(
-      name||null, clinicName||null, clinicAddr||null, clinicPhone||null,
-      therapies ? JSON.stringify(therapies) : null,
-      prices    ? JSON.stringify(prices)    : null,
-      req.user.id
+router.put('/', async (req, res) => {
+  try {
+    const { name, clinicName, clinicAddr, clinicPhone, therapies, prices } = req.body;
+    await db.none(
+      `UPDATE users SET
+        name         = COALESCE($1, name),
+        clinic_name  = COALESCE($2, clinic_name),
+        clinic_addr  = COALESCE($3, clinic_addr),
+        clinic_phone = COALESCE($4, clinic_phone),
+        therapies    = COALESCE($5, therapies),
+        prices       = COALESCE($6, prices),
+        updated_at   = NOW()
+       WHERE id=$7`,
+      [
+        name||null, clinicName||null, clinicAddr||null, clinicPhone||null,
+        therapies ? JSON.stringify(therapies) : null,
+        prices    ? JSON.stringify(prices)    : null,
+        req.user.id
+      ]
     );
-  _audit(req.user.id, 'AYARLAR GÜNCELLENDİ', req);
-  res.json(_safeUser(db.prepare('SELECT * FROM users WHERE id=?').get(req.user.id)));
+    await _audit(req.user.id, 'AYARLAR GUNCELLENDI', req);
+    const u = await db.oneOrNone('SELECT * FROM users WHERE id=$1', [req.user.id]);
+    res.json(_safeUser(u));
+  } catch (e) { res.status(500).json({ error: 'Sunucu hatasi.' }); }
 });
 
 // GET /api/settings/audit  — KVKK denetim izi
-router.get('/audit', (req, res) => {
-  const limit = Math.min(parseInt(req.query.limit) || 100, 500);
-  const logs  = db.prepare(
-    'SELECT action,created_at,ip FROM audit_log WHERE user_id=? ORDER BY created_at DESC LIMIT ?'
-  ).all(req.user.id, limit);
-  res.json(logs);
+router.get('/audit', async (req, res) => {
+  try {
+    const limit = Math.min(parseInt(req.query.limit) || 100, 500);
+    const logs  = await db.any(
+      'SELECT action, created_at, ip FROM audit_log WHERE user_id=$1 ORDER BY created_at DESC LIMIT $2',
+      [req.user.id, limit]
+    );
+    res.json(logs);
+  } catch (e) { res.status(500).json({ error: 'Sunucu hatasi.' }); }
 });
 
 // GET /api/settings/dashboard
 // frontend okur: totalPatients, todayCount, monthSessions, monthRevenue, riskPatients, trend, thyDist
-router.get('/dashboard', (req, res) => {
-  const uid   = req.user.id;
-  const today = new Date().toISOString().slice(0,10);
-  const month = today.slice(0,7);
+router.get('/dashboard', async (req, res) => {
+  try {
+    const uid   = req.user.id;
+    const today = new Date().toISOString().slice(0,10);
+    const month = today.slice(0,7);
 
-  const totalPatients = db.prepare(
-    "SELECT COUNT(*) v FROM patients WHERE user_id=?"
-  ).get(uid).v;
+    const totalPatientsRow = await db.one(
+      'SELECT COUNT(*) v FROM patients WHERE user_id=$1', [uid]
+    );
+    const todayCountRow = await db.one(
+      'SELECT COUNT(*) v FROM appointments WHERE user_id=$1 AND at_time::date = $2',
+      [uid, today]
+    );
+    const monthSessionsRow = await db.one(
+      `SELECT COUNT(*) v FROM appointments WHERE user_id=$1 AND lower(status)='completed' AND at_time LIKE $2`,
+      [uid, month+'%']
+    );
+    const monthRevenueRow = await db.one(
+      `SELECT COALESCE(SUM(amount), 0) v FROM invoices WHERE user_id=$1 AND lower(status)='paid' AND date LIKE $2`,
+      [uid, month+'%']
+    );
 
-  const todayCount = db.prepare(
-    "SELECT COUNT(*) v FROM appointments WHERE user_id=? AND date(at_time)=?"
-  ).get(uid, today).v;
+    // PHQ9 >= 15 → yüksek risk
+    const riskPatients = await db.any(`
+      SELECT p.id, p.first_name fn, p.last_name ln, s.score last_phq9
+      FROM patients p
+      JOIN scores s ON s.patient_id=p.id AND s.scale='PHQ9'
+      WHERE p.user_id=$1
+        AND s.created_at = (SELECT MAX(created_at) FROM scores WHERE patient_id=p.id AND scale='PHQ9')
+        AND s.score >= 15
+      ORDER BY s.score DESC
+    `, [uid]);
 
-  const monthSessions = db.prepare(
-    "SELECT COUNT(*) v FROM appointments WHERE user_id=? AND lower(status)='completed' AND at_time LIKE ?"
-  ).get(uid, month+'%').v;
+    // Son 6 aylık tamamlanan seans trendi
+    const trend = await db.any(`
+      SELECT TO_CHAR(at_time::date, 'YYYY-MM') m, COUNT(*) cnt
+      FROM appointments WHERE user_id=$1 AND lower(status)='completed'
+      GROUP BY m ORDER BY m DESC LIMIT 6
+    `, [uid]);
 
-  const monthRevenue = db.prepare(
-    "SELECT COALESCE(SUM(amount),0) v FROM invoices WHERE user_id=? AND lower(status)='paid' AND date LIKE ?"
-  ).get(uid, month+'%').v;
+    // Terapi türü dağılımı
+    const thyDist = await db.any(`
+      SELECT therapy, COUNT(*) cnt FROM appointments
+      WHERE user_id=$1 AND lower(status)='completed'
+      GROUP BY therapy ORDER BY cnt DESC
+    `, [uid]);
 
-  // PHQ9 >= 15 → yüksek risk
-  const riskPatients = db.prepare(`
-    SELECT p.id, p.first_name fn, p.last_name ln, s.score last_phq9
-    FROM patients p
-    JOIN scores s ON s.patient_id=p.id AND s.scale='PHQ9'
-    WHERE p.user_id=?
-      AND s.created_at=(SELECT MAX(created_at) FROM scores WHERE patient_id=p.id AND scale='PHQ9')
-      AND s.score>=15
-    ORDER BY s.score DESC
-  `).all(uid);
-
-  // Son 6 aylık tamamlanan seans trendi
-  const trend = db.prepare(`
-    SELECT strftime('%Y-%m', at_time) m, COUNT(*) cnt
-    FROM appointments WHERE user_id=? AND lower(status)='completed'
-    GROUP BY m ORDER BY m DESC LIMIT 6
-  `).all(uid).reverse();
-
-  // Terapi türü dağılımı
-  const thyDist = db.prepare(`
-    SELECT therapy, COUNT(*) cnt FROM appointments
-    WHERE user_id=? AND lower(status)='completed'
-    GROUP BY therapy ORDER BY cnt DESC
-  `).all(uid);
-
-  res.json({ totalPatients, todayCount, monthSessions, monthRevenue, riskPatients, trend, thyDist });
+    res.json({
+      totalPatients: parseInt(totalPatientsRow.v),
+      todayCount:    parseInt(todayCountRow.v),
+      monthSessions: parseInt(monthSessionsRow.v),
+      monthRevenue:  parseFloat(monthRevenueRow.v),
+      riskPatients,
+      trend: trend.reverse(),
+      thyDist,
+    });
+  } catch (e) { console.error('[Settings] dashboard:', e); res.status(500).json({ error: 'Sunucu hatasi.' }); }
 });
 
 module.exports = router;
