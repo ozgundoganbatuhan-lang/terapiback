@@ -18,7 +18,8 @@ module.exports = async function auth(req, res, next) {
     // Trial süresi kontrolü
     if (user.plan === 'trial' && user.trial_ends) {
       const exp = new Date(user.trial_ends);
-      if (exp < new Date()) {
+      // Süresi dolan hesap salt okunur: verilerini görebilir ve dışa aktarabilir, değişiklik yapamaz.
+      if (exp < new Date() && req.method !== 'GET') {
         return res.status(402).json({
           error: 'Deneme süreniz doldu. Lütfen bir plana abone olun.',
           code: 'TRIAL_EXPIRED'
