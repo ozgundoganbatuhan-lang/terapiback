@@ -62,6 +62,22 @@ if (process.env.NODE_ENV !== 'production') {
 }
 
 // ── ROUTES ────────────────────────────────────────────────────
+// Merkez (guzellik.seansim.com/yonetim) üye listesi: sunucudan sunucuya, ortak anahtarla
+app.get('/api/merkez/uyeler', async (req, res) => {
+  if (req.get('x-merkez-key') !== (process.env.MERKEZ_KEY || 'trk_5f0c2b7e91a44d6c')) return res.status(401).json({ error: 'yetkisiz' });
+  try {
+    const rows = await require('./src/db/database').any(
+      `SELECT name, email, phone, clinic_name, clinic_phone, plan, trial_ends, email_verified, created_at FROM users ORDER BY created_at DESC LIMIT 2000`);
+    res.set('Cache-Control', 'no-store').json({ members: rows.map(r => ({
+      name: r.name, email: r.email, phone: r.phone || r.clinic_phone || null, org: r.clinic_name || 'bağımsız', city: null,
+      role: r.email_verified ? 'Psikolog' : 'Psikolog · e-posta doğrulanmadı',
+      plan: (r.plan || 'trial') === 'trial' ? 'TRIAL' : 'ACTIVE',
+      trialEndsAt: (r.plan || 'trial') === 'trial' && r.trial_ends ? new Date(r.trial_ends).toISOString() : null,
+      createdAt: new Date(r.created_at).toISOString(), lastSeen: null,
+    })) });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 app.use('/api/auth',         require('./src/routes/auth'));
 app.use('/api/patients',     require('./src/routes/patients'));
 app.use('/api/appointments', require('./src/routes/appointments'));
